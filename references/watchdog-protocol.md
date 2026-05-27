@@ -166,6 +166,71 @@ Stay alive when:
 - Blocked notification: after 30 minutes (once)
 - Retry notification: every 5th failure
 
+## Channel Notifications
+
+The cron sends progress updates to the user via their channel (Feishu/Discord/etc).
+Notifications are FYI only — never block execution waiting for reply.
+
+### When to notify:
+
+| Event | Message | Example |
+|-------|---------|--------|
+| Task started | 🚀 Task {id} started: {name} | 🚀 Task 002 started: Verify login page |
+| Task passed | ✓ Task {id} passed ({duration}) | ✓ Task 002 passed (1m48s) |
+| Task failed (5th retry) | ⚠️ Task {id} failed x5: {reason} | ⚠️ Task 003 failed x5: CDP timeout |
+| Task blocked | ⏸ Task {id} blocked: {reason} | ⏸ Task 003 blocked: build not done |
+| Task unblocked | ▶️ Task {id} unblocked, resuming | ▶️ Task 003 unblocked, resuming |
+| Project completed | 🎉 Project done! {passed}/{total} tasks | 🎉 Project done! 15/15 tasks |
+| Sub-agent died | 🔄 Task {id} agent died, retrying | 🔄 Task 002 agent died, retrying |
+
+### When NOT to notify:
+
+- Task still running, agent alive (silent wait)
+- Normal heartbeat (no change)
+- Retry 1-4 (only notify on 5th)
+- Blocked check still failing (already notified once)
+
+### How to notify:
+
+In the cron prompt, include the user's channel target:
+```
+Notification target: {channel_target}
+To notify: use message(action="send", target="{channel_target}", message="...")
+```
+
+The `channel_target` is stored in state.json at project init:
+```json
+{
+  "projectId": "my-feature",
+  "notifyTarget": "user:ou_xxxxx",
+  "notifyChannel": "feishu",
+  ...
+}
+```
+
+### Sub-agent execution mode:
+
+Prefer Claude Code CLI when available:
+```
+exec: claude --print -p "<task prompt>" --output-file tasks/{id}/output.md
+```
+
+Fallback to sessions_spawn if Claude Code not installed:
+```
+sessions_spawn(task="<task prompt>", mode="run")
+```
+
+state.json records which mode was used:
+```json
+{
+  "id": "002",
+  "status": "running",
+  "execMode": "claude-code",
+  "pid": 12345,
+  "sessionKey": null
+}
+```
+
 ## Why This Works
 
 1. **No long-lived session** — each cron is independent, reads everything from files

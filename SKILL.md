@@ -375,10 +375,13 @@ When spawning a sub-agent for a task:
 3. If retry: include previous failure reasons
 4. Write full prompt to `tasks/<id>/prompt.md`
 5. Instruct sub-agent to write output to `tasks/<id>/output.md`
-6. Spawn via `sessions_spawn` (mode: run, isolated)
-7. Record returned sessionKey in state.json task: `"sessionKey": "subagent:xxx"`
+6. Execute sub-agent (prefer Claude Code CLI if available):
+   - **Claude Code mode**: `claude --print -p "<prompt>" --output-file tasks/<id>/output.md`
+   - **Fallback mode**: `sessions_spawn(task="<prompt>", mode="run")`
+7. Record execution info in state.json: `"execMode": "claude-code"` or `"session-spawn"`, plus pid/sessionKey
 8. Set task status = "running", record startedAt
-9. Append heartbeat, exit
+9. Notify user via channel: "🚀 Task {id} started: {name}"
+10. Append heartbeat, exit
 
 The cron does NOT wait for the sub-agent. It exits immediately after spawn.
 Next cron cycle (2min later) will check if output.md appeared.
@@ -486,6 +489,30 @@ Sub-agents should be instructed in their prompt to call the log script at key mo
 - `scripts/status.mjs` - Read and display project status, progress, and health
 - `scripts/check-flow-health.mjs` - Check state.json health (used by watchdog)
 - `scripts/log.mjs` - Append structured log entry
+
+## Channel Notifications
+
+The orchestrator cron sends progress updates to the user via their messaging channel.
+Notifications are informational only — they never block execution.
+
+On project init, store the notification target in state.json:
+```json
+{
+  "notifyTarget": "user:ou_xxxxx",
+  "notifyChannel": "feishu"
+}
+```
+
+Notification rules:
+- Task started → notify
+- Task passed → notify with duration
+- Task blocked → notify once
+- Task failed 5th+ retry → notify
+- Sub-agent died → notify
+- Project completed → notify
+- Everything else → silent
+
+See `references/watchdog-protocol.md` for message format details.
 
 ## References
 
