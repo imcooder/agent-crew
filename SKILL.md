@@ -192,6 +192,17 @@ Supported RETRY_CONDITION formats:
 - `command:<shell command>` - Run command, unblocked if exit code = 0
 - `manual` - Only user can unblock (via "resume project")
 
+state.json for a running task:
+```json
+{
+  "id": "002",
+  "status": "running",
+  "startedAt": "2026-05-27T10:00:00Z",
+  "sessionKey": "subagent:abc123",
+  "retryCount": 0
+}
+```
+
 state.json for a blocked task:
 ```json
 {
@@ -322,8 +333,10 @@ Read state.json
          +-- task.status = "pending" → spawn sub-agent, set running, exit
          +-- task.status = "running":
          |     +-- output.md exists → validate (see step 3)
-         |     +-- no output, started < 10min → wait, heartbeat, exit
-         |     +-- no output, started > 10min → assume dead, set pending, exit
+         |     +-- no output → check sub-agent session (via sessions_list or subagents list):
+         |           +-- session alive → still working, heartbeat, exit
+         |           +-- session exited/not found → dead, set pending for retry, exit
+         |           +-- no sessionKey in state + started > 10min → assume dead, set pending, exit
          +-- task.status = "blocked":
          |     +-- evaluate retryCondition
          |     +-- condition met → set pending, exit
@@ -363,8 +376,9 @@ When spawning a sub-agent for a task:
 4. Write full prompt to `tasks/<id>/prompt.md`
 5. Instruct sub-agent to write output to `tasks/<id>/output.md`
 6. Spawn via `sessions_spawn` (mode: run, isolated)
-7. Set task status = "running", record startedAt
-8. Append heartbeat, exit
+7. Record returned sessionKey in state.json task: `"sessionKey": "subagent:xxx"`
+8. Set task status = "running", record startedAt
+9. Append heartbeat, exit
 
 The cron does NOT wait for the sub-agent. It exits immediately after spawn.
 Next cron cycle (2min later) will check if output.md appeared.

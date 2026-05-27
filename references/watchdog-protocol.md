@@ -21,6 +21,36 @@ openclaw cron add \
   --task "<orchestrator prompt below>"
 ```
 
+## Sub-Agent Liveness Detection
+
+When a task is "running" but has no output.md yet, the cron must determine
+if the sub-agent is still alive:
+
+### Method 1: sessions_list (preferred)
+```
+Read task.sessionKey from state.json
+Call sessions_list or subagents(action=list)
+If sessionKey appears in active list → alive, keep waiting
+If sessionKey not found or appears in completed/failed → dead
+```
+
+### Method 2: Timeout fallback
+If no sessionKey was recorded (legacy state), fall back to time-based:
+- Started < 10min ago → assume alive
+- Started > 10min ago → assume dead
+
+### On dead sub-agent detected:
+1. Set task status = "pending"
+2. Increment retryCount
+3. Clear sessionKey
+4. Log: `[warn] Sub-agent for task {id} died without output, retrying`
+5. Next cron cycle will spawn a fresh sub-agent
+
+### Why this matters:
+Without liveness detection, a crashed sub-agent leaves the task in "running"
+forever. The cron would see "running, no output, still within timeout" and
+keep waiting indefinitely. Checking session state breaks this deadlock.
+
 ## Cron Prompt (the orchestrator)
 
 Each cron invocation acts as a self-contained orchestrator turn:
