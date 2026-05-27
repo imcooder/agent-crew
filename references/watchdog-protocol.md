@@ -1,89 +1,146 @@
 # Watchdog Protocol
 
-Exact behavior for the watchdog cron job.
+The watchdog cron IS the orchestrator. It does not "notify" anyone — it drives the project forward directly.
+
+## Design Principle (borrowed from Ralph loop)
+
+Ralph loop works because the outer loop is a native process that never dies.
+In OpenClaw/Feishu channel mode, the equivalent is a cron job: it fires every N minutes regardless of session state. Each cron invocation is a fresh, stateless session that reads state.json and takes action.
+
+Key insight: **no long-lived orchestrator session exists**. The "orchestrator" is a pattern that emerges from repeated cron invocations, each one reading state, acting, and exiting.
 
 ## Setup
 
-On project start, the orchestrator creates a cron job:
+On project start:
 
 ```
 openclaw cron add \
-  --name "crew-watchdog-{projectId}" \
+  --name "crew-{projectId}" \
   --every "2m" \
   --session isolated \
-  --task "<watchdog prompt below>"
+  --task "<orchestrator prompt below>"
 ```
 
-## Watchdog Prompt
+## Cron Prompt (the orchestrator)
 
-The cron task prompt should be:
+Each cron invocation acts as a self-contained orchestrator turn:
 
 ```
-You are a project watchdog. Your only job is to check project health and recover stalls.
+You are the orchestrator for project "{projectId}".
+Your job: advance the project by exactly one step, then exit.
 
-## Instructions
+Work directory: {work_dir}
 
-1. Read the state file at: {work_dir}/state.json
-2. Check the project status:
-   - If "completed" or "cancelled": remove this cron job and exit
-   - If "paused": append watchdog heartbeat to state.json and exit
-   - If "running": continue to step 3
-3. Check lastHeartbeat timestamp:
-   - If less than 5 minutes old: project is alive. Append watchdog heartbeat. Exit.
-   - If more than 5 minutes old: project may be stalled. Continue to step 4.
-4. Stall detected. Take action:
-   - Append heartbeat: {"agent": "watchdog", "at": "<now>", "action": "stall detected, triggering resume"}
-   - Update lastHeartbeat to now
-   - Write state.json
-   - Append to log.md: [warn] Watchdog detected stall, triggering resume
-   - Send resume signal: sessions_send to orchestrator session or spawn a new orchestrator session with resume task
+## Procedure
 
-## Important Rules
-- Do NOT modify task statuses. Only orchestrator does that.
-- Do NOT spawn sub-agents. Only orchestrator does that.
-- You MAY update: lastHeartbeat, heartbeats array
-- You MAY trigger: resume of orchestrator
-- Keep heartbeats array to last 50 entries (trim oldest if over)
-- If state.json does not exist, log error and exit (do not create it)
+1. Read state.json
+2. Route based on project status:
+   - "completed" or "cancelled" → remove this cron job, exit
+   - "paused" → append heartbeat, exit
+   - "running" or "blocked" → continue
+
+3. Find the current task (currentTaskIndex):
+
+   a) If status = "passed" → advance currentTaskIndex, find next pending task, go to (c)
+   
+   b) If status = "running":
+      - Check if output file exists: tasks/{id}/output.md
+      - If output exists → validate it (see Validation below)
+      - If no output and task started > 10min ago → assume sub-agent died, reset to "pending"
+      - If no output and task started < 10min ago → still working, append heartbeat, exit
+   
+   c) If status = "pending" → spawn sub-agent for this task:
+      - Build prompt from role-prompts.md template
+      - Include last checkpoint as context
+      - Write prompt to tasks/{id}/prompt.md
+      - Spawn sub-agent: sessions_spawn with task prompt
+      - Set task status = "running", record startedAt
+      - Append heartbeat, exit
+   
+   d) If status = "blocked":
+      - Evaluate retryCondition
+      - If condition met → set to "pending", log unblock
+      - If not met and blocked > 30min → notify user (once)
+      - Append heartbeat, exit
+   
+   e) If status = "failed":
+      - Increment retryCount (no limit)
+      - Set to "pending" for retry
+      - Include failure reason in next prompt
+      - Every 5th retry: notify user (FYI only, keep going)
+      - Append heartbeat, exit
+
+4. If ALL tasks are "passed" → set project status = "completed", notify user, remove cron
+
+## Validation
+
+When a task's output.md exists:
+1. Read output.md content
+2. Check for promise tags in output:
+   - Contains "STATUS: COMPLETE" or "STATUS: PASSED" → mark task as passed
+   - Contains "STATUS: BLOCKED" + "REASON:" → mark task as blocked
+   - Contains "STATUS: FAILED" + "REASON:" → mark task as failed
+   - No status tag but has substantive content → evaluate against acceptance criteria
+   - Empty or garbage → mark as failed
+3. Write validation result to tasks/{id}/validation.md
+4. Update state.json accordingly
+
+## Sub-Agent Output Protocol
+
+Sub-agents MUST include in their output:
+
 ```
+STATUS: COMPLETE
+SUMMARY: <what was done>
+```
+
+Or:
+```
+STATUS: BLOCKED
+REASON: <why>
+RETRY_CONDITION: <file_exists:/path | command:cmd | manual>
+```
+
+Or:
+```
+STATUS: FAILED
+REASON: <what went wrong>
+```
+
+If sub-agent crashes without writing output.md, the next cron cycle detects "running > 10min, no output" and retries.
+
+## Heartbeat
+
+Every cron invocation appends to state.json heartbeats:
+```json
+{"agent": "orchestrator", "at": "<ISO timestamp>", "action": "<what was done this cycle>"}
+```
+
+Keep last 50 entries, trim oldest.
 
 ## Self-Cleanup
 
-The watchdog removes itself when:
-- Project status is "completed"
-- Project status is "cancelled"
-- Project status is "failed" (all retries exhausted)
+Remove cron when:
+- Project status = "completed"
+- Project status = "cancelled"
 
-The watchdog stays alive (monitor-only) when:
-- Project status is "paused" (just records heartbeats, no recovery action)
+Stay alive when:
+- "running" — drive tasks forward
+- "paused" — heartbeat only
+- "blocked" — keep probing conditions
 
-## Stall Threshold
+## Timing
 
-Default: 5 minutes without any heartbeat update.
+- Cron interval: 2 minutes
+- Sub-agent timeout: 10 minutes (if no output after 10min, assume dead)
+- Blocked notification: after 30 minutes (once)
+- Retry notification: every 5th failure
 
-This accounts for:
-- Normal task execution (most tasks complete in < 5min of silence)
-- Network delays
-- Cron interval (2min) + processing time
+## Why This Works
 
-If a task legitimately runs longer than 5 minutes without logging, it should be instructed to write periodic heartbeats (e.g., "still compiling..." every 2 minutes).
-
-## Blocked Task Handling
-
-When the watchdog finds tasks with status = "blocked":
-
-1. Read the task's `retryCondition` field
-2. Evaluate the condition:
-   - `file_exists:<path>` - Run `Test-Path` or equivalent
-   - `command:<cmd>` - Execute and check exit code
-   - `manual` - Skip (only user can unblock)
-3. If condition is NOW met:
-   - Set task status back to "pending"
-   - Log: `[info] Task {id} unblocked: condition met`
-   - Trigger orchestrator resume
-4. If condition still not met:
-   - Log: `[info] Task {id} still blocked: {reason}`
-   - If blocked > 30 minutes: notify user once
-   - Continue checking next cycle
-
-This means: even if the entire project is "blocked", the cron keeps running and actively probing. The moment the external condition is satisfied (e.g., build finishes), the project resumes automatically within 2 minutes.
+1. **No long-lived session** — each cron is independent, reads everything from files
+2. **Survives any crash** — even if OpenClaw restarts, cron picks back up
+3. **One step per cycle** — prevents context overflow (each invocation is short)
+4. **State is truth** — state.json is the only coordination mechanism
+5. **Sub-agent independence** — sub-agents write to files, don't need orchestrator alive
+```

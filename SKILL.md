@@ -1,6 +1,6 @@
 ---
 name: agent-crew
-version: 0.2.0
+version: 0.3.0
 description: >
   Autonomous multi-agent team orchestration framework. Reads a project.md
   file that defines roles, requirements, design, and acceptance criteria,
@@ -19,6 +19,7 @@ description: >
 
 | Version | Date | Changes |
 |---------|------|------|
+| 0.3.0 | 2026-05-27 | **Breaking**: Cron IS the orchestrator (no long-lived orchestrator session). Borrowed from Ralph loop: one step per cron cycle, sub-agent output via file + status tags, 10min timeout for dead agents. Eliminates all "session died" failure modes. |
 | 0.2.0 | 2026-05-27 | Added blocked state, prerequisites, auto-resume on condition met, watchdog condition probing, status.mjs script, removed Python scripts |
 | 0.1.0 | 2026-05-26 | Initial release: project lifecycle (start/resume/pause/cancel/status), filesystem-based state, heartbeat tracking, global logging, role prompts with output protocol, watchdog/resume protocols, init-project script |
 
@@ -279,83 +280,144 @@ Failed projects notify the user with full context: what succeeded, what failed, 
 
 ## Core Workflow
 
-### 1. Parse project.md
+### Design Principle: Cron IS the Orchestrator
 
-Run `scripts/parse-project.mjs` to extract structured data.
+Borrowed from Ralph loop: the outer loop must be a process that never dies.
+In OpenClaw/channel mode, that process is a **cron job**. Each cron invocation
+is a fresh stateless session that reads state.json, takes exactly one step,
+and exits. There is NO long-lived orchestrator session.
 
-### 2. Create Work Directory
+The "orchestrator" is an emergent pattern from repeated cron invocations.
 
-Create `project/<name>/` with:
-- `state.json` (initial state, all tasks as "pending")
-- `tasks/` directory structure
-- `checkpoints/` directory
-- `log.md` (first entry: "Project started")
+### 1. Initialize (one-time, on "start project")
 
-### 3. Task Assignment Loop
-
-For each task in order (respecting dependencies):
-
-1. Identify the assigned role
-2. Build role prompt from `references/role-prompts.md` template
-3. Include latest checkpoint as context
-4. Write prompt to `tasks/<id>/prompt.md`
-5. Spawn sub-agent with the prompt
-6. Update state.json: task status = "running", record startedAt
-7. Append heartbeat
-
-### 4. Completion Handling
-
-When a sub-agent completes:
-
-1. Read its output (from session result or file it wrote)
-2. Write to `tasks/<id>/output.md`
-3. Validate against acceptance criteria
-4. Write validation result to `tasks/<id>/validation.md`
-5. If PASSED:
-   - Update state.json: task status = "passed"
-   - Write checkpoint to `checkpoints/after-<id>.md`
-   - Advance to next task
-6. If FAILED:
-   - Increment retryCount in state.json
-   - Re-spawn with failure context appended to prompt
-   - Every 5th retry: notify user (informational only, do NOT wait for response, keep retrying immediately)
-7. If BLOCKED:
-   - Set task status to "blocked" in state.json
-   - Record blockedReason and retryCondition from sub-agent output
-   - Do NOT increment retryCount
-   - Watchdog will handle condition checking and auto-resume
-8. Append heartbeat after every state change
-
-### 5. Watchdog (Cron)
-
-On project start, set up:
+1. Run `scripts/parse-project.mjs` to extract structured data
+2. Create work directory `project/<name>/` with:
+   - `state.json` (all tasks as "pending")
+   - `tasks/` directory structure
+   - `checkpoints/` directory
+   - `log.md` (first entry: "Project started")
+3. Set up the orchestrator cron:
 ```
 openclaw cron add \
-  --name "crew-watchdog-<projectId>" \
+  --name "crew-{projectId}" \
   --every "2m" \
   --session isolated \
-  --task "Read state.json at <path>. Append watchdog heartbeat. If lastHeartbeat is older than 5min and status is running, trigger resume on orchestrator session."
+  --task "<orchestrator prompt from watchdog-protocol.md>"
+```
+4. Notify user: project started, cron active
+
+### 2. Cron Cycle (every 2 minutes, autonomous)
+
+Each cron invocation performs exactly ONE step:
+
+```
+Read state.json
+    |
+    +-- completed/cancelled → remove cron, exit
+    +-- paused → heartbeat, exit
+    +-- running/blocked → find current task:
+         |
+         +-- task.status = "passed" → advance to next, exit
+         +-- task.status = "pending" → spawn sub-agent, set running, exit
+         +-- task.status = "running":
+         |     +-- output.md exists → validate (see step 3)
+         |     +-- no output, started < 10min → wait, heartbeat, exit
+         |     +-- no output, started > 10min → assume dead, set pending, exit
+         +-- task.status = "blocked":
+         |     +-- evaluate retryCondition
+         |     +-- condition met → set pending, exit
+         |     +-- not met, > 30min → notify user (once), exit
+         |     +-- not met, < 30min → heartbeat, exit
+         +-- task.status = "failed":
+               +-- increment retryCount, set pending
+               +-- every 5th: notify user (FYI only)
+               +-- exit
+    +-- all tasks passed → set completed, remove cron, notify user
 ```
 
-Watchdog actions:
-- Read state.json
-- Append heartbeat entry
-- Check blocked tasks: evaluate each task's retryCondition
-  - `file_exists:<path>` → check if path exists
-  - `command:<cmd>` → run command, check exit code
-  - If condition met → set task to "pending", log unblock event
-- Check if project is stalled (lastHeartbeat > 5min old, no blocked tasks)
-- If stalled: send resume signal via sessions_send
-- If blocked > 30min: notify user but keep checking
-- If completed/cancelled: remove itself (cron delete)
+Key rule: **one step per cycle, then exit.** This prevents context overflow.
+
+### 3. Validation (within a cron cycle)
+
+When `tasks/<id>/output.md` exists:
+
+1. Read output content
+2. Check for status tags:
+   - `STATUS: COMPLETE` → task passed
+   - `STATUS: BLOCKED` + `REASON:` → task blocked
+   - `STATUS: FAILED` + `REASON:` → task failed
+   - No tag but substantive content → evaluate against acceptance criteria
+   - Empty/garbage → task failed
+3. Write result to `tasks/<id>/validation.md`
+4. Update state.json
+5. Write checkpoint to `checkpoints/after-<id>.md` (if passed)
+
+### 4. Sub-Agent Spawning (within a cron cycle)
+
+When spawning a sub-agent for a task:
+
+1. Build prompt from `references/role-prompts.md` template
+2. Include last checkpoint as context
+3. If retry: include previous failure reasons
+4. Write full prompt to `tasks/<id>/prompt.md`
+5. Instruct sub-agent to write output to `tasks/<id>/output.md`
+6. Spawn via `sessions_spawn` (mode: run, isolated)
+7. Set task status = "running", record startedAt
+8. Append heartbeat, exit
+
+The cron does NOT wait for the sub-agent. It exits immediately after spawn.
+Next cron cycle (2min later) will check if output.md appeared.
+
+### 5. Sub-Agent Output Protocol
+
+Sub-agents MUST write to `tasks/<id>/output.md` with this structure:
+
+```
+STATUS: COMPLETE
+SUMMARY: <brief description of what was done>
+
+## Details
+<full output, code changes, test results, etc.>
+```
+
+Or for blocked:
+```
+STATUS: BLOCKED
+REASON: <human-readable explanation>
+RETRY_CONDITION: <file_exists:/path | command:cmd | manual>
+```
+
+Or for failed:
+```
+STATUS: FAILED
+REASON: <what went wrong>
+
+## Error Details
+<stack traces, logs, etc.>
+```
+
+If sub-agent crashes without writing output.md, the next cron cycle
+detects "running > 10min, no output" and resets to pending for retry.
 
 ### 6. Project Completion
 
-When all tasks pass:
+When all tasks have status = "passed":
 1. Set state.json status = "completed", write completedAt
-2. Remove watchdog cron job
+2. Remove cron job
 3. Write final entry to log.md
-4. Notify user
+4. Notify user with summary
+
+### Why This Never Stops
+
+| Failure Mode | What Happens |
+|---|---|
+| Sub-agent crashes | No output.md → cron retries in 2min |
+| Sub-agent loops forever | >10min timeout → cron kills and retries |
+| Main session dies | Irrelevant — cron doesn't need it |
+| OpenClaw restarts | Cron persists across restarts |
+| Context overflow | Impossible — each cron cycle is fresh |
+| Network timeout | Sub-agent fails → retry next cycle |
 
 ## Logging
 
